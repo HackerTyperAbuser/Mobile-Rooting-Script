@@ -44,12 +44,12 @@ See `-h` for the authoritative list of options. Summary:
 | *(none)* | **Autonomous** (default): installs tooling, downloads root tooling, fetches the Burp CA, provisions + launches the AVD, runs rootAVD, installs modules, verifies. Minimal prompts. |
 | `--manual` | Interactive mode: restores the `y/n` prompts and waits for **you** to create/open the AVD (does **not** auto-create one unless `--create-avd` is also given). |
 | `--create-avd` | In `--manual` mode, create the default AVD instead of waiting for you. |
-| `--clean` | Delete the AVD (frees its multi-GB userdata/snapshots) and restore the stock ramdisk(s), then exit. Use **between** re-tests. The ~2.5 GB system image is kept (it's reused). |
+| `--clean` | Delete the AVD (frees its multi-GB userdata/snapshots), restore any patched stock ramdisk(s), clean-delete the API 35 SDK system image, then exit. Use **between full re-tests**. |
 
 ### Typical loop
 
 ```powershell
-python auto_root_avd.py --clean     # reset to a clean slate (between tests)
+python auto_root_avd.py --clean     # clean-delete the AVD and API 35 system image
 python auto_root_avd.py             # root from scratch
 ```
 

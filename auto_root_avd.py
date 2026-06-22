@@ -18,6 +18,7 @@ avdmanager, emulator) and OpenSSL.
 """
 
 import argparse
+import ctypes
 import os
 import shutil
 import signal
@@ -111,11 +112,26 @@ def err(msg=""):
         print(msg, file=sys.stderr, flush=True)
 
 
+def _enable_windows_ansi():
+    if os.name != "nt":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def alert(msg):
     """Prominent banner for a manual / attention step."""
     bar = "=" * 70
+    yellow = "\033[33m"
+    reset = "\033[0m"
     with _print_lock:
-        print(f"\n{bar}\n>>> {msg}\n{bar}", flush=True)
+        print(f"\n{yellow}{bar}\n>>> {msg}\n{bar}{reset}", flush=True)
 
 
 class Progress:
@@ -700,14 +716,72 @@ def _inject_cert_into_zip(zip_path, hashed_file, hash_name):
 
 
 # --------------------------------------------------------------------------- #
-# --clean : delete the AVD and restore the stock ramdisk (for repeat testing)
+# --clean : delete the AVD and installed system image (for repeat testing)
 # --------------------------------------------------------------------------- #
+def _default_system_image_package():
+    return IMAGE_TMPL.format(lvl=DEFAULT_API)
+
+
+def _default_system_image_dir():
+    return (SDK_ROOT / "system-images" / f"android-{DEFAULT_API}"
+            / "google_apis_playstore" / "x86_64")
+
+
+def _path_is_under(path, parent):
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _prune_empty_system_image_dirs(image_dir):
+    for parent in (image_dir.parent, image_dir.parent.parent):
+        try:
+            parent.rmdir()
+            log(f"[+] Removed empty SDK directory: {parent.relative_to(SDK_ROOT)}")
+        except OSError:
+            pass
+
+
+def _remove_default_system_image():
+    """Clean-delete the SDK system image provisioned by this script."""
+    image = _default_system_image_package()
+    image_dir = _default_system_image_dir()
+    sysimg_root = SDK_ROOT / "system-images"
+
+    if not _path_is_under(image_dir, sysimg_root):
+        raise MissingTool(f"Refusing to remove unexpected SDK path: {image_dir}")
+
+    if not image_dir.exists():
+        log(f"[=] SDK system image not present: {image}")
+        _prune_empty_system_image_dirs(image_dir)
+        return
+
+    log(f"[*] Uninstalling SDK system image: {image}")
+    r = bat(SDKMANAGER, "--uninstall", image, input_data="y\n" * 5)
+    if image_dir.exists():
+        if r.returncode != 0:
+            err(r.stdout)
+            err(r.stderr)
+        log(f"[*] Removing SDK image directory tree: "
+            f"{image_dir.relative_to(SDK_ROOT)}")
+        shutil.rmtree(image_dir)
+    else:
+        log(f"[+] Uninstalled SDK system image: {image}")
+
+    if image_dir.exists():
+        raise MissingTool(f"SDK system image still exists after clean: {image_dir}")
+    log(f"[+] SDK system image removed: {image}")
+    _prune_empty_system_image_dirs(image_dir)
+
+
 def clean_avd():
     """Delete the AVD (reclaims its multi-GB userdata/snapshots) and restore EVERY
     rootAVD-patched image across the SDK, so the next root test starts clean. Works
     on any environment: it derives the SDK from adb and restores all *.backup files
-    rootAVD created (any API level / image type / ABI). System images are kept
-    (shared and reused)."""
+    rootAVD created (any API level / image type / ABI). The default SDK system
+    image installed by this script is clean-deleted too."""
     resolve_sdk_tooling()
 
     # Stop a running emulator first so files aren't locked.
@@ -759,7 +833,9 @@ def clean_avd():
     if restored == 0:
         log("[=] No rootAVD .backup files found; images already stock.")
 
-    log("[+] Clean complete (system images kept — they're reused).")
+    _remove_default_system_image()
+
+    log("[+] Clean complete (AVD and API SDK system image clean-deleted).")
 
 
 # --------------------------------------------------------------------------- #
@@ -800,9 +876,8 @@ def _set_avd_config(updates):
 def provision_avd():
     """Install image, create the default AVD (if needed) and launch it."""
     global EMULATOR_PROC
-    image = IMAGE_TMPL.format(lvl=DEFAULT_API)
-    image_dir = (SDK_ROOT / "system-images" / f"android-{DEFAULT_API}"
-                 / "google_apis_playstore" / "x86_64")
+    image = _default_system_image_package()
+    image_dir = _default_system_image_dir()
 
     if image_dir.exists():
         log(f"[=] System image already installed, skipping sdkmanager: {image}")
@@ -811,10 +886,16 @@ def provision_avd():
         bat(SDKMANAGER, "--licenses", input_data="y\n" * 30)
         log(f"[*] Installing system image: {image}")
         r = bat(SDKMANAGER, "--install", image, input_data="y\n" * 10)
-        if r.returncode != 0 or not image_dir.exists():
+        # sdkmanager on Windows often returns a non-zero exit code even when the
+        # download/install succeeded, so trust whether the image actually landed
+        # rather than the exit code.
+        if not image_dir.exists():
             err(r.stdout)
             err(r.stderr)
             raise MissingTool(f"sdkmanager failed to install {image}")
+        if r.returncode != 0:
+            log(f"[!] sdkmanager exit code {r.returncode}, but the image is "
+                f"present — continuing.")
 
     if _avd_exists(AVD_NAME):
         log(f"[=] AVD '{AVD_NAME}' already exists, reusing it.")
@@ -1171,8 +1252,8 @@ def parse_args():
                         "waiting for the user to create one.")
     p.add_argument("--clean", action="store_true",
                    help="Delete the AVD (frees its GBs of userdata/snapshots) and "
-                        "restore the stock ramdisk, then exit. The ~2.5GB system "
-                        "image is kept for reuse. Use between root re-tests.")
+                        "clean-delete the API 35 SDK system image, then exit. "
+                        "Use between full root re-tests.")
     return p.parse_args()
 
 
@@ -1183,6 +1264,7 @@ def main():
         sys.stderr.reconfigure(encoding="utf-8")
     except Exception:  # noqa: BLE001
         pass
+    _enable_windows_ansi()
 
     args = parse_args()
     MANUAL = args.manual
@@ -1198,7 +1280,8 @@ def main():
             log("")
             log(CANCEL_MSG)
             sys.exit(1)
-        except MissingTool:
+        except MissingTool as e:
+            err(f"[x] {e}")
             sys.exit(1)
         except Exception as e:  # noqa: BLE001
             err(f"[x] Unexpected error: {e}")
@@ -1234,7 +1317,8 @@ def main():
         log("")
         log(CANCEL_MSG)
         sys.exit(1)
-    except MissingTool:
+    except MissingTool as e:
+        err(f"[x] {e}")
         cleanup()
         sys.exit(1)
     except Exception as e:  # noqa: BLE001
