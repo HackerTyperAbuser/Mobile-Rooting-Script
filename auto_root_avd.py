@@ -18,6 +18,7 @@ avdmanager, emulator) and OpenSSL.
 """
 
 import argparse
+import configparser
 import ctypes
 import os
 import shutil
@@ -37,11 +38,12 @@ from pathlib import Path
 # --------------------------------------------------------------------------- #
 SCRIPT_DIR = Path(__file__).resolve().parent
 TOOLING_DIR = SCRIPT_DIR / "root_tooling"
+CONFIG_PATH = SCRIPT_DIR / "avd_config.ini"   # AVD settings (see load_avd_config)
 
 TOTAL_STEPS = 6
-AVD_NAME = "auto_root_avd"
-DEVICE = "pixel_8"
-DEFAULT_API = 35
+AVD_NAME = "auto_root_avd"      # default; overridden by avd_config.ini [avd] name
+DEVICE = "pixel_8"             # default device profile
+DEFAULT_API = 35              # default API level
 IMAGE_TMPL = "system-images;android-{lvl};google_apis_playstore;x86_64"
 BURP_CERT_URL = "http://127.0.0.1:8080/cert"
 OPENSSL_WINGET_ID = "ShiningLight.OpenSSL.Light"
@@ -68,11 +70,24 @@ TOOLING_URLS = {
 # Modules pushed to the device, in Magisk install order (framework before module).
 MODULE_INSTALL_ORDER = ["ZygiskNext.zip", "NoHello.zip", "adguardcert.zip"]
 
+# Module install robustness: after first root, Magisk/network may not be ready.
+MAGISK_SETTLE_SEC = 20       # pause after Magisk is ready, before installing
+MODULE_RETRIES = 3           # attempts per push / install
+MODULE_RETRY_DELAY = 15      # seconds between attempts
+
 # --------------------------------------------------------------------------- #
 # Globals (resolved / set at runtime)
 # --------------------------------------------------------------------------- #
 MANUAL = False
 CREATE_AVD = False
+
+# AVD settings — populated from avd_config.ini in main() (defaults below).
+API_LEVEL = DEFAULT_API      # int
+DEVICE_PROFILE = DEVICE      # str, avdmanager -d
+RAM_MB = None                # int MB or None (image default)
+STORAGE = None               # str size e.g. "8G" or None (data partition)
+SDCARD = None                # str size e.g. "512M" or None
+AVD_HOME = None              # str dir or None → Android default (~/.android/avd)
 
 ADB = None
 SDK_ROOT = None             # Android SDK root (parent of platform-tools)
@@ -171,10 +186,11 @@ progress = Progress()
 # --------------------------------------------------------------------------- #
 # Subprocess helpers (tracked for clean cancellation)
 # --------------------------------------------------------------------------- #
-def run(cmd, cwd=None, input_data=None, capture=True):
+def run(cmd, cwd=None, input_data=None, capture=True, timeout=None):
     """Run a command, tracking the child so cleanup() can terminate it.
 
     Uses RUN_ENV (JAVA_HOME / ANDROID_AVD_HOME pinned) once tooling is resolved.
+    `timeout` (seconds) kills the child and returns returncode 124 if exceeded.
     """
     if CANCEL.is_set():
         raise Cancel()
@@ -192,12 +208,18 @@ def run(cmd, cwd=None, input_data=None, capture=True):
     with _procs_lock:
         _active_procs.add(proc)
     try:
-        out, errout = proc.communicate(input=input_data)
+        try:
+            out, errout = proc.communicate(input=input_data, timeout=timeout)
+            rc = proc.returncode
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, errout = proc.communicate()
+            rc = 124
     finally:
         with _procs_lock:
             _active_procs.discard(proc)
     return types.SimpleNamespace(
-        returncode=proc.returncode,
+        returncode=rc,
         stdout=out or "",
         stderr=errout or "",
     )
@@ -214,13 +236,24 @@ def bat(batpath, *args, input_data=None, capture=True):
                cwd=str(batpath.parent), input_data=input_data, capture=capture)
 
 
-def adb(*args, capture=True):
-    return run([ADB, *map(str, args)], capture=capture)
+def adb(*args, capture=True, timeout=None):
+    return run([ADB, *map(str, args)], capture=capture, timeout=timeout)
 
 
 def su(cmd):
     """Run a command as root on the device via 'su -c'."""
     return adb("shell", f"su -c '{cmd}'")
+
+
+def is_rooted(timeout=25):
+    """Quick, bounded check whether the running AVD already has working root.
+    Returns True if `su -c id` reports uid=0. Bounded so a Magisk grant prompt
+    (rooted-but-not-granted) can't hang the pre-check."""
+    try:
+        r = adb("shell", "su", "-c", "id", timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return False
+    return "uid=0" in (r.stdout or "")
 
 
 # --------------------------------------------------------------------------- #
@@ -229,6 +262,13 @@ def su(cmd):
 def _check_cancel():
     if CANCEL.is_set():
         raise Cancel()
+
+
+def _interruptible_sleep(seconds):
+    """Sleep in 1s slices so Ctrl+C / cancel stays responsive."""
+    for _ in range(int(seconds)):
+        _check_cancel()
+        time.sleep(1)
 
 
 def wait_for_device(timeout=900):
@@ -488,7 +528,7 @@ def resolve_sdk_tooling():
     #  - SKIP_JDK_VERSION_CHECK as a belt-and-suspenders for very-new JDKs.
     #  - ANDROID_HOME/ANDROID_SDK_ROOT so rootAVD resolves the SDK + system-image
     #    ramdisk path deterministically (else it guesses ~/Android/Sdk).
-    avd_home = Path.home() / ".android" / "avd"
+    avd_home = Path(AVD_HOME) if AVD_HOME else (Path.home() / ".android" / "avd")
     avd_home.mkdir(parents=True, exist_ok=True)
     RUN_ENV = os.environ.copy()
     RUN_ENV["JAVA_HOME"] = str(jdk)
@@ -719,11 +759,11 @@ def _inject_cert_into_zip(zip_path, hashed_file, hash_name):
 # --clean : delete the AVD and installed system image (for repeat testing)
 # --------------------------------------------------------------------------- #
 def _default_system_image_package():
-    return IMAGE_TMPL.format(lvl=DEFAULT_API)
+    return IMAGE_TMPL.format(lvl=API_LEVEL)
 
 
 def _default_system_image_dir():
-    return (SDK_ROOT / "system-images" / f"android-{DEFAULT_API}"
+    return (SDK_ROOT / "system-images" / f"android-{API_LEVEL}"
             / "google_apis_playstore" / "x86_64")
 
 
@@ -900,9 +940,9 @@ def provision_avd():
     if _avd_exists(AVD_NAME):
         log(f"[=] AVD '{AVD_NAME}' already exists, reusing it.")
     else:
-        log(f"[*] Creating AVD '{AVD_NAME}' ({DEVICE}, API {DEFAULT_API}) ...")
+        log(f"[*] Creating AVD '{AVD_NAME}' ({DEVICE_PROFILE}, API {API_LEVEL}) ...")
         r = bat(AVDMANAGER, "create", "avd", "-n", AVD_NAME, "-k", image,
-                "-d", DEVICE, input_data="no\n")
+                "-d", DEVICE_PROFILE, input_data="no\n")
         # avdmanager can exit 0 even when it refuses to run (e.g. JDK check),
         # so verify the AVD actually exists rather than trusting returncode.
         if not _avd_exists(AVD_NAME):
@@ -912,11 +952,20 @@ def provision_avd():
                 f"avdmanager did not create '{AVD_NAME}' (see output above).")
         log(f"[+] AVD '{AVD_NAME}' created.")
 
-    # Enable the hardware (host) keyboard — avdmanager-created AVDs default to
-    # hw.keyboard=no, which makes the AVD ignore your physical keyboard. Must be
-    # set before launch (config.ini is read at boot).
-    _set_avd_config({"hw.keyboard": "yes"})
-    log("[=] Enabled hardware keyboard (hw.keyboard=yes).")
+    # Apply config.ini settings before launch (read at boot). hw.keyboard=yes is
+    # always set (avdmanager AVDs default to hw.keyboard=no → host keyboard
+    # ignored); RAM / data-partition / sdcard come from avd_config.ini when set.
+    cfg = {"hw.keyboard": "yes"}
+    if RAM_MB:
+        cfg["hw.ramSize"] = str(RAM_MB)
+    if STORAGE:
+        cfg["disk.dataPartition.size"] = _normalize_size(STORAGE)
+    if SDCARD:
+        cfg["hw.sdCard"] = "yes"
+        cfg["sdcard.size"] = _normalize_size(SDCARD)
+    _set_avd_config(cfg)
+    log("[=] AVD config applied: "
+        + ", ".join(f"{k}={v}" for k, v in cfg.items()))
 
     log(f"[*] Launching emulator '{AVD_NAME}' ...")
     EMULATOR_PROC = subprocess.Popen([str(EMULATOR), "-avd", AVD_NAME,
@@ -977,8 +1026,8 @@ def do_rooting():
     if (not MANUAL) or CREATE_AVD:
         provision_avd()
     else:
-        alert(f"Create and open a Google Play AVD (recommended: Pixel 7, "
-              f"API {DEFAULT_API}). Waiting for the emulator to start ...")
+        alert(f"Create and open a Google Play AVD (recommended: {DEVICE_PROFILE}, "
+              f"API {API_LEVEL}). Waiting for the emulator to start ...")
     wait_for_boot()
     log("[+] Emulator booted.")
 
@@ -989,55 +1038,62 @@ def do_rooting():
         raise MissingTool(f"Could not read AVD API level (got {level!r}).")
     log(f"[=] Running AVD API level: {level}")
 
-    # 4) Confirm rootAVD lists a Play image for this level
-    r = bat(ROOTAVD_BAT, "ListAllAVDs")
-    if f"android-{level}" not in r.stdout:
-        log(f"[!] rootAVD ListAllAVDs did not list android-{level}; "
-            f"continuing with the standard path anyway.")
+    # 4) Fast path — if the AVD is already rooted (e.g. a re-run on a previously
+    #    rooted AVD), skip rootAVD / FAKEBOOTIMG / cold boot entirely.
+    if is_rooted():
+        log("[=] Device already rooted (su -c id → uid=0); skipping rootAVD.")
+        root_ok = True
+    else:
+        # 4a) Confirm rootAVD lists a Play image for this level
+        r = bat(ROOTAVD_BAT, "ListAllAVDs")
+        if f"android-{level}" not in r.stdout:
+            log(f"[!] rootAVD ListAllAVDs did not list android-{level}; "
+                f"continuing with the standard path anyway.")
 
-    # 5) Pre-instruct the (inherent) manual step, then run rootAVD FAKEBOOTIMG.
-    #    rootAVD creates /sdcard/Download/fakeboot.img, AUTO-LAUNCHES Magisk and
-    #    waits ~60s for you to patch it, then flashes the ramdisk and reboots.
-    #    The instruction MUST come first because the 60s window is inside the run.
-    ramdisk = (f"system-images\\android-{level}\\google_apis_playstore\\"
-               f"x86_64\\ramdisk.img")
-    alert("MANUAL STEP — rootAVD will now create /sdcard/Download/fakeboot.img\n"
-          "and AUTO-LAUNCH the Magisk app on the AVD. When Magisk opens (~60s):\n"
-          "    Install  >  Select and Patch a File  >\n"
-          "    /sdcard/Download/fakeboot.img  >  Let's Go\n"
-          "rootAVD then flashes the patched ramdisk and reboots the AVD.")
-    pause("Press Enter to start rootAVD FAKEBOOTIMG ... ", fallback_wait=180)
+        # 5) Pre-instruct the (inherent) manual step, then run rootAVD FAKEBOOTIMG.
+        #    rootAVD creates /sdcard/Download/fakeboot.img, AUTO-LAUNCHES Magisk and
+        #    waits ~60s for you to patch it, then flashes the ramdisk and reboots.
+        #    The instruction MUST come first because the 60s window is inside the run.
+        ramdisk = (f"system-images\\android-{level}\\google_apis_playstore\\"
+                   f"x86_64\\ramdisk.img")
+        alert("MANUAL STEP — rootAVD will now create /sdcard/Download/fakeboot.img\n"
+              "and AUTO-LAUNCH the Magisk app on the AVD. When Magisk opens (~60s):\n"
+              "    Install  >  Select and Patch a File  >\n"
+              "    /sdcard/Download/fakeboot.img  >  Let's Go\n"
+              "rootAVD then flashes the patched ramdisk and reboots the AVD.")
+        pause("Press Enter to start rootAVD FAKEBOOTIMG ... ", fallback_wait=180)
 
-    log(f"[*] Running rootAVD FAKEBOOTIMG: {ramdisk}")
-    bat(ROOTAVD_BAT, ramdisk, "FAKEBOOTIMG", capture=False)  # live output
+        log(f"[*] Running rootAVD FAKEBOOTIMG: {ramdisk}")
+        bat(ROOTAVD_BAT, ramdisk, "FAKEBOOTIMG", capture=False)  # live output
 
-    # 6) rootAVD powered the AVD off; cold-boot it so the patched ramdisk loads
-    #    (a soft reboot would not reload ramdisk.img).
-    cold_boot_avd()
+        # 6) rootAVD powered the AVD off; cold-boot it so the patched ramdisk loads
+        #    (a soft reboot would not reload ramdisk.img).
+        cold_boot_avd()
 
-    # 7) Finalize Magisk. The patched ramdisk loads on cold boot, but Magisk's
-    #    su/daemon need a one-time "Additional Setup" that writes its env to
-    #    /data/adb/magisk (rootAVD's temporary-Magisk removal wipes it). Until
-    #    that's done + a reboot, `su` returns Permission denied. Bring the app to
-    #    the foreground and walk the user through it.
-    try:
-        adb("shell", "monkey", "-p", "com.topjohnwu.magisk",
-            "-c", "android.intent.category.LAUNCHER", "1")
-    except Exception:  # noqa: BLE001
-        pass
-    alert("FINALIZE ROOT on the AVD — open the Magisk app, then:\n"
-          "  1) If it says 'Requires Additional Setup' -> tap it ->\n"
-          "     Method: DIRECT INSTALL -> let the AVD REBOOT when it offers to.\n"
-          "  2) After the reboot, when a Magisk 'Superuser Request' for 'shell'\n"
-          "     appears, tap GRANT and tick 'Remember choice' (Forever).\n"
-          "The script keeps polling and continues once 'su' works.")
+        # 7) Finalize Magisk. The patched ramdisk loads on cold boot, but Magisk's
+        #    su/daemon need a one-time "Additional Setup" that writes its env to
+        #    /data/adb/magisk (rootAVD's temporary-Magisk removal wipes it). Until
+        #    that's done + a reboot, `su` returns Permission denied. Bring the app to
+        #    the foreground and walk the user through it.
+        try:
+            adb("shell", "monkey", "-p", "com.topjohnwu.magisk",
+                "-c", "android.intent.category.LAUNCHER", "1")
+        except Exception:  # noqa: BLE001
+            pass
+        alert("FINALIZE ROOT on the AVD — open the Magisk app, then:\n"
+              "  1) If it says 'Requires Additional Setup' -> tap it ->\n"
+              "     Method: DIRECT INSTALL -> let the AVD REBOOT when it offers to.\n"
+              "  2) After the reboot, when a Magisk 'Superuser Request' for 'shell'\n"
+              "     appears, tap GRANT and tick 'Remember choice' (Forever).\n"
+              "The script keeps polling and continues once 'su' works.")
 
-    # 8) Verify root (polls through the Additional-Setup reboot)
-    log("[*] Waiting for root to come up ...")
-    root_ok = wait_for_root(timeout=1800)
+        # 8) Verify root (polls through the Additional-Setup reboot)
+        log("[*] Waiting for root to come up ...")
+        root_ok = wait_for_root(timeout=1800)
+
+    # 9) On success, make shell root permanent/silent; else print guidance.
     if root_ok:
         log("[+] Root confirmed (uid=0).")
-        # Make shell root permanent/silent for the rest of the run.
         try:
             su('magisk --sqlite "REPLACE INTO policies '
                '(uid,policy,until,logging,notification) VALUES(2000,2,0,0,0)"')
@@ -1104,13 +1160,21 @@ def install_modules(root_confirmed):
         err("    setup (Direct Install) > reboot until it's stable, then re-run.")
         abort()
 
+    # 0b) Slow down right after first root — Magisk (and any network the module
+    #     installers use) can need a moment to settle before installs are reliable.
+    log(f"[*] Letting Magisk settle for {MAGISK_SETTLE_SEC}s before installing ...")
+    _interruptible_sleep(MAGISK_SETTLE_SEC)
+
     # 1) Grant Magisk shell root so installs run unattended (autonomous only)
     if not MANUAL:
         log("[*] Granting Magisk root to shell (uid 2000) ...")
         su('magisk --sqlite "REPLACE INTO policies '
            '(uid,policy,until,logging,notification) VALUES(2000,2,0,0,0)"')
 
-    # 2) Network off
+    # 2) Turn Wi-Fi / data OFF before importing modules. Modules are pushed
+    #    locally with `adb push` (not downloaded on-device), so no internet is
+    #    needed — the earlier "fails to install" was Magisk not being ready, which
+    #    the settle + retries above/below handle. Networking is re-enabled at the end.
     if MANUAL:
         ask_yes_no("Turn off Wi-Fi on the AVD, then continue? (y/n)")
     else:
@@ -1118,36 +1182,50 @@ def install_modules(root_confirmed):
         adb("shell", "svc", "wifi", "disable")
         adb("shell", "svc", "data", "disable")
 
-    # 3) Push modules to /sdcard/Download/
+    # 3) Push modules to /sdcard/Download/ (retry a couple of times)
     for name in MODULE_INSTALL_ORDER:
         local = TOOLING_DIR / name
-        log(f"[*] Pushing {name} ...")
-        r = adb("push", str(local), "/sdcard/Download/")
-        if r.returncode != 0:
-            err(r.stderr)
+        pushed = False
+        for attempt in range(1, MODULE_RETRIES + 1):
+            log(f"[*] Pushing {name} (attempt {attempt}/{MODULE_RETRIES}) ...")
+            r = adb("push", str(local), "/sdcard/Download/")
+            if r.returncode == 0:
+                pushed = True
+                break
+            if r.stderr.strip():
+                err(r.stderr.strip())
+            _interruptible_sleep(MODULE_RETRY_DELAY)
+        if not pushed:
             raise MissingTool(f"adb push failed for {name}")
 
-    # 4) Install modules via Magisk CLI (framework -> module -> cert), verifying
-    #    each one actually lands in /data/adb/modules.
-    before = set(_list_modules())
+    # 4) Install each module (framework -> module -> cert), retrying and verifying
+    #    it actually lands in /data/adb/modules.
     for name in MODULE_INSTALL_ORDER:
-        log(f"[*] Installing module {name} via Magisk ...")
-        r = su(f"magisk --install-module /sdcard/Download/{name}")
-        if r.stdout.strip():
-            log(r.stdout.strip())
-        if r.stderr.strip():
-            log(r.stderr.strip())
-    after = set(_list_modules())
-    added = sorted(after - before)
-    log(f"[=] Module ids now present: {sorted(after) or '(none)'}")
-    if not after:
-        err("[!] No modules detected under /data/adb/modules after install.")
-    elif added:
-        log(f"[+] Newly installed: {added}")
-    else:
-        log("[=] No new module ids (they may already have been installed).")
+        installed = False
+        for attempt in range(1, MODULE_RETRIES + 1):
+            before = set(_list_modules())
+            log(f"[*] Installing {name} via Magisk "
+                f"(attempt {attempt}/{MODULE_RETRIES}) ...")
+            r = su(f"magisk --install-module /sdcard/Download/{name}")
+            if r.stdout.strip():
+                log(r.stdout.strip())
+            if r.stderr.strip():
+                log(r.stderr.strip())
+            # Success = magisk reported ok, or a new module id appeared.
+            if r.returncode == 0 or len(_list_modules()) > len(before):
+                installed = True
+                break
+            log(f"[!] {name} didn't install; retrying in {MODULE_RETRY_DELAY}s ...")
+            _interruptible_sleep(MODULE_RETRY_DELAY)
+        if not installed:
+            err(f"[!] {name} failed to install after {MODULE_RETRIES} attempts.")
 
-    # 5) Reboot to activate the modules, then re-confirm root.
+    mods = _list_modules()
+    log(f"[=] Module ids now present: {sorted(mods) or '(none)'}")
+    if not mods:
+        err("[!] No modules detected under /data/adb/modules after install.")
+
+    # 5) Reboot to activate the modules, then re-confirm root + verify.
     log("[*] Rebooting the AVD to activate modules ...")
     adb("reboot")
     wait_for_boot()
@@ -1238,6 +1316,114 @@ def _sigint(signum, frame):
 
 
 # --------------------------------------------------------------------------- #
+# AVD configuration file (avd_config.ini)
+# --------------------------------------------------------------------------- #
+_CONFIG_TEMPLATE = """\
+# AVD configuration for auto_root_avd.py
+# The script reads these to create the emulator. Blank/omitted values use the
+# built-in defaults or the system image's own default. Lines starting with # are
+# comments.
+
+[avd]
+# Google Play system image API level (needs a google_apis_playstore x86_64 image)
+api = 35
+
+# avdmanager hardware profile (list options with: avdmanager list device)
+device = pixel_8
+
+# AVD name
+name = auto_root_avd
+
+# RAM in MB, e.g. 4096. Blank = image default.
+ram_mb =
+
+# Internal / data-partition size, e.g. 8G or 8192M. Blank = image default.
+storage =
+
+# SD card size, e.g. 512M. Blank = none.
+sdcard =
+
+# Where to store the AVD (.avd userdata/snapshots), e.g. E:\\AVDs .
+# Blank = Android default (C:\\Users\\<you>\\.android\\avd).
+avd_path =
+"""
+
+
+def _valid_size(s):
+    """True if s is empty or a size like 8G / 8192M / 8192 (bare = MB)."""
+    s = str(s).strip()
+    if not s:
+        return True
+    if s[-1].upper() in ("K", "M", "G"):
+        s = s[:-1]
+    return s.isdigit() and int(s) > 0
+
+
+def _normalize_size(s):
+    """Normalize a size: '8G'->'8G', bare '8192'->'8192M', suffix upper-cased."""
+    s = str(s).strip()
+    if not s:
+        return s
+    if s[-1].upper() in ("K", "M", "G"):
+        return s[:-1] + s[-1].upper()
+    return s + "M" if s.isdigit() else s
+
+
+def load_avd_config(path):
+    """Load AVD settings from an INI file's [avd] section. Returns a dict with
+    keys name/api/device/ram_mb/storage/sdcard/avd_path. Writes a commented
+    template (with defaults) if the file is missing. Invalid values → exit."""
+    defaults = {"name": AVD_NAME, "api": str(DEFAULT_API), "device": DEVICE,
+                "ram_mb": "", "storage": "", "sdcard": "", "avd_path": ""}
+    raw = dict(defaults)
+
+    if not path.exists():
+        try:
+            path.write_text(_CONFIG_TEMPLATE, encoding="utf-8")
+            log(f"[=] Wrote AVD config template: {path}")
+        except Exception as e:  # noqa: BLE001
+            err(f"[!] Could not write config template {path}: {e}")
+    else:
+        parser = configparser.ConfigParser()
+        try:
+            parser.read(path, encoding="utf-8")
+        except configparser.Error as e:
+            err(f"[x] Could not parse {path}: {e}")
+            sys.exit(1)
+        if parser.has_section("avd"):
+            for k in defaults:
+                if parser.has_option("avd", k):
+                    raw[k] = (parser.get("avd", k) or "").strip()
+        log(f"[=] Loaded AVD config: {path}")
+
+    conf = {}
+    conf["name"] = raw["name"].strip() or AVD_NAME
+    conf["device"] = raw["device"].strip() or DEVICE
+
+    api_s = raw["api"].strip() or str(DEFAULT_API)
+    if not api_s.isdigit():
+        err(f"[x] config: 'api' must be an integer (got {api_s!r}).")
+        sys.exit(1)
+    conf["api"] = int(api_s)
+
+    ram_s = raw["ram_mb"].strip()
+    if ram_s and (not ram_s.isdigit() or int(ram_s) <= 0):
+        err(f"[x] config: 'ram_mb' must be a positive integer MB (got {ram_s!r}).")
+        sys.exit(1)
+    conf["ram_mb"] = int(ram_s) if ram_s else None
+
+    for key in ("storage", "sdcard"):
+        val = raw[key].strip()
+        if val and not _valid_size(val):
+            err(f"[x] config: '{key}' must be like 8G / 8192M / 8192 (got {val!r}).")
+            sys.exit(1)
+        conf[key] = val or None
+
+    conf["avd_path"] = raw["avd_path"].strip() or None
+    return conf
+
+
+# --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
 def parse_args():
@@ -1252,13 +1438,17 @@ def parse_args():
                         "waiting for the user to create one.")
     p.add_argument("--clean", action="store_true",
                    help="Delete the AVD (frees its GBs of userdata/snapshots) and "
-                        "clean-delete the API 35 SDK system image, then exit. "
-                        "Use between full root re-tests.")
+                        "clean-delete the configured API's SDK system image, then "
+                        "exit. Use between full root re-tests.")
+    p.add_argument("--config", default=None,
+                   help="Path to the AVD config INI (default: avd_config.ini next "
+                        "to the script; auto-created with a template if missing).")
     return p.parse_args()
 
 
 def main():
-    global MANUAL, CREATE_AVD
+    global MANUAL, CREATE_AVD, AVD_NAME, API_LEVEL, DEVICE_PROFILE
+    global RAM_MB, STORAGE, SDCARD, AVD_HOME
     try:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
@@ -1270,6 +1460,19 @@ def main():
     MANUAL = args.manual
     CREATE_AVD = args.create_avd
     signal.signal(signal.SIGINT, _sigint)
+
+    # Load AVD settings from the config file (creates a template if missing).
+    conf = load_avd_config(Path(args.config) if args.config else CONFIG_PATH)
+    AVD_NAME = conf["name"]
+    API_LEVEL = conf["api"]
+    DEVICE_PROFILE = conf["device"]
+    RAM_MB = conf["ram_mb"]
+    STORAGE = conf["storage"]
+    SDCARD = conf["sdcard"]
+    AVD_HOME = conf["avd_path"]
+    log(f"    AVD: name={AVD_NAME} api={API_LEVEL} device={DEVICE_PROFILE} "
+        f"ram={RAM_MB or 'default'} storage={STORAGE or 'default'} "
+        f"sdcard={SDCARD or 'none'} path={AVD_HOME or 'default (C:)'}")
 
     if args.clean:
         log("=== auto_root_avd === mode: CLEAN")
