@@ -1274,7 +1274,13 @@ def verify_and_finalize():
         adb("shell", "svc", "wifi", "enable")
         adb("shell", "svc", "data", "enable")
 
-    # 5) Final message
+    # 5) Mark the device provisioned / setup complete so the AVD is ready to use
+    #    (skips the setup wizard). No root needed; persists in /data.
+    log("[*] Marking device provisioned (skipping setup wizard) ...")
+    adb("shell", "settings", "put", "global", "device_provisioned", "1")
+    adb("shell", "settings", "put", "secure", "user_setup_complete", "1")
+
+    # 6) Final message
     log("")
     log(FINAL_MSG)
     progress.done()
