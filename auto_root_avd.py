@@ -19,7 +19,7 @@ avdmanager, emulator) and OpenSSL.
 
 import argparse
 import configparser
-import ctypes
+import ctypes 
 import os
 import shutil
 import signal
@@ -60,8 +60,8 @@ TOOLING_URLS = {
         "https://github.com/MhmRdd/NoHello/releases/download/0.0.7/"
         "Nohello-v0.0.7-53-4d53ecf-release.zip",
     "ZygiskNext.zip":
-        "https://github.com/Dr-TSNG/ZygiskNext/releases/download/v1.4.0/"
-        "Zygisk-Next-1.4.0-768-37ee2d5-release.zip",
+        "https://github.com/LSPosed/ZygiskNext/releases/download/1.5.0/"
+        "Zygisk-Next-1.5.0-843-5217106-release.zip",
     "adguardcert.zip":
         "https://github.com/trongngk/tmp/releases/download/checklist/"
         "adguardcert-v2.1_2.zip",
@@ -93,6 +93,7 @@ ADB = None
 SDK_ROOT = None             # Android SDK root (parent of platform-tools)
 SDKMANAGER = None
 AVDMANAGER = None
+ANDROID_CLI = None          # new 'android' CLI (replaces deprecated sdkmanager)
 EMULATOR = None
 OPENSSL = None
 ROOTAVD_BAT = None          # Path to rootAVD.bat if already present on the system
@@ -419,6 +420,24 @@ def _resolve_sdk_bat(sdk_root, name):
     return Path(which) if which else None
 
 
+def _resolve_android_cli(sdk_root):
+    """Find the new 'android' CLI (android.exe) that ships in cmdline-tools.
+
+    Since 2025 the command-line tools deprecate sdkmanager in favour of this
+    binary for installing/removing SDK packages; sdkmanager now just redirects
+    to it. Searches cmdline-tools/latest/bin, cmdline-tools/<ver>/bin, then PATH.
+    """
+    candidates = [sdk_root / "cmdline-tools" / "latest" / "bin" / "android.exe"]
+    versioned = sorted((sdk_root / "cmdline-tools").glob("*/bin"), reverse=True) \
+        if (sdk_root / "cmdline-tools").exists() else []
+    candidates += [d / "android.exe" for d in versioned]
+    for c in candidates:
+        if c.exists():
+            return c
+    which = shutil.which("android")
+    return Path(which) if which else None
+
+
 def _resolve_emulator(sdk_root):
     cand = sdk_root / "emulator" / "emulator.exe"
     if cand.exists():
@@ -467,7 +486,7 @@ def resolve_sdk_tooling():
 
     Shared by ensure_tooling() and clean_avd(); no OpenSSL, no progress bar.
     """
-    global ADB, SDK_ROOT, SDKMANAGER, AVDMANAGER, EMULATOR, RUN_ENV
+    global ADB, SDK_ROOT, SDKMANAGER, AVDMANAGER, ANDROID_CLI, EMULATOR, RUN_ENV
 
     # --- Android Studio + adb (detect only) ---
     adb_path = shutil.which("adb")
@@ -489,6 +508,7 @@ def resolve_sdk_tooling():
     SDK_ROOT = sdk_root
     SDKMANAGER = _resolve_sdk_bat(sdk_root, "sdkmanager")
     AVDMANAGER = _resolve_sdk_bat(sdk_root, "avdmanager")
+    ANDROID_CLI = _resolve_android_cli(sdk_root)
     EMULATOR = _resolve_emulator(sdk_root)
 
     if not SDKMANAGER or not AVDMANAGER:
@@ -509,6 +529,8 @@ def resolve_sdk_tooling():
         raise MissingTool("emulator")
     log(f"[=] sdkmanager: {SDKMANAGER}")
     log(f"[=] avdmanager: {AVDMANAGER}")
+    if ANDROID_CLI:
+        log(f"[=] android CLI: {ANDROID_CLI}")
     log(f"[=] emulator:   {EMULATOR}")
 
     # --- JDK 17+ (sdkmanager/avdmanager require it; pin a known-good one) ---
@@ -637,11 +659,9 @@ def ensure_burp_ca():
     progress.start(3, "burp-ca")
     dest = TOOLING_DIR / "burpca.der"
 
-    if dest.exists():
-        log("[=] Burp CA already present")
-        progress.done()
-        return
-
+    # Autonomous: always pull from the running proxy so we bake in the CURRENT
+    # CA. A rotated Burp CA reuses the same subject_hash filename (9a5ba575.0)
+    # with different bytes, so a cached burpca.der would silently go stale.
     if not MANUAL:
         try:
             log(f"[*] Fetching Burp CA from {BURP_CERT_URL} ...")
@@ -652,11 +672,20 @@ def ensure_burp_ca():
             tmp = TOOLING_DIR / "burpca.der.part"
             tmp.write_bytes(data)
             os.replace(tmp, dest)
-            log("[+] Fetched Burp CA from running proxy")
+            log("[+] Fetched current Burp CA from running proxy")
             progress.done()
             return
         except Exception as e:  # noqa: BLE001
+            if dest.exists():
+                log(f"[!] Could not reach Burp ({e}); using existing burpca.der.")
+                progress.done()
+                return
             log(f"[!] Could not reach Burp ({e}); falling back to manual drop.")
+
+    if dest.exists():
+        log("[=] Burp CA already present")
+        progress.done()
+        return
 
     alert(f"Place your Burp Suite CA (DER) at:\n    {dest}\n"
           f"(Burp: Proxy > Proxy settings > Import/export CA certificate > "
@@ -674,21 +703,20 @@ def ensure_burp_ca():
 def prepare_burp_cert(cert_error):
     """Convert the Burp CA and bake it into adguardcert.zip. Sets BURP_HASH.
 
-    If a <hash>.0 already exists in the tooling folder, reuse it and skip OpenSSL.
+    Always regenerates <hash>.0 from the freshly fetched burpca.der when it is
+    present, so a rotated Burp CA can't leave a stale cert behind: Burp's subject
+    is constant ('PortSwigger'), so subject_hash_old stays the same (9a5ba575)
+    even after the key changes — the filename is identical but the bytes differ.
+    Only when no burpca.der exists do we fall back to reusing an existing
+    <hash>.0. The cert is written into the zip whenever the baked bytes differ
+    from the current ones (not merely when the entry name is missing).
     """
     global BURP_HASH
     try:
-        existing = sorted(TOOLING_DIR.glob("*.0"))
-        if existing:
-            # Bypass OpenSSL: reuse the already-converted CA hash file.
-            hashed = existing[0]
-            BURP_HASH = hashed.stem
-            log(f"[=] Reusing existing CA hash file {hashed.name}; "
-                f"skipping OpenSSL.")
-        else:
-            burp_der = TOOLING_DIR / "burpca.der"
-            cacert_pem = TOOLING_DIR / "cacert.pem"
+        burp_der = TOOLING_DIR / "burpca.der"
+        cacert_pem = TOOLING_DIR / "cacert.pem"
 
+        if burp_der.exists():
             # 1) DER -> PEM
             _check_cancel()
             r = run([OPENSSL, "x509", "-inform", "der", "-in", str(burp_der),
@@ -705,17 +733,27 @@ def prepare_burp_cert(cert_error):
             BURP_HASH = r.stdout.strip().splitlines()[0].strip()
             log(f"[*] Burp CA subject_hash_old = {BURP_HASH}")
 
-            # 3) copy cacert.pem -> <hash>.0
+            # 3) (over)write cacert.pem -> <hash>.0 (refresh any stale copy)
             _check_cancel()
             hashed = TOOLING_DIR / f"{BURP_HASH}.0"
             shutil.copyfile(cacert_pem, hashed)
+        else:
+            existing = sorted(TOOLING_DIR.glob("*.0"))
+            if not existing:
+                raise RuntimeError(
+                    "no burpca.der and no <hash>.0 to bake into adguardcert.zip")
+            hashed = existing[0]
+            BURP_HASH = hashed.stem
+            log(f"[=] No burpca.der; reusing existing CA hash file "
+                f"{hashed.name} (skipping OpenSSL).")
 
-        # 4) bake into adguardcert.zip (skip if it already has this cert)
+        # 4) bake into adguardcert.zip — replace whenever the baked cert is
+        #    missing OR its bytes differ from the current one.
         _check_cancel()
         zip_path = TOOLING_DIR / "adguardcert.zip"
         entry = f"system/etc/security/cacerts/{BURP_HASH}.0"
-        if _zip_has_entry(zip_path, entry):
-            log(f"[=] adguardcert.zip already contains {BURP_HASH}.0.")
+        if _zip_entry_bytes(zip_path, entry) == hashed.read_bytes():
+            log(f"[=] adguardcert.zip already has the current {BURP_HASH}.0.")
         else:
             _inject_cert_into_zip(zip_path, hashed, BURP_HASH)
 
@@ -725,12 +763,15 @@ def prepare_burp_cert(cert_error):
         cert_error.append(e)
 
 
-def _zip_has_entry(zip_path, entry):
+def _zip_entry_bytes(zip_path, entry):
+    """Return the bytes of `entry` inside zip_path, or None if absent/unreadable."""
     try:
         with zipfile.ZipFile(zip_path, "r") as z:
-            return entry in z.namelist()
+            if entry in z.namelist():
+                return z.read(entry)
     except Exception:  # noqa: BLE001
-        return False
+        pass
+    return None
 
 
 def _inject_cert_into_zip(zip_path, hashed_file, hash_name):
@@ -799,7 +840,7 @@ def _remove_default_system_image():
         return
 
     log(f"[*] Uninstalling SDK system image: {image}")
-    r = bat(SDKMANAGER, "--uninstall", image, input_data="y\n" * 5)
+    r = _sdk_remove(image)
     if image_dir.exists():
         if r.returncode != 0:
             err(r.stdout)
@@ -901,16 +942,55 @@ def _avd_dir():
 
 
 def _set_avd_config(updates):
-    """Set/overwrite key=value pairs in the AVD's config.ini."""
+    """Set/overwrite key=value pairs in the AVD's config.ini.
+
+    A value of None removes the key entirely (used to drop a stray
+    disk.dataPartition.path=<temp>, which makes /data ephemeral).
+    """
     cfg = _avd_dir() / "config.ini"
     lines = cfg.read_text(errors="replace").splitlines() if cfg.exists() else []
     out = [ln for ln in lines
            if "=" not in ln or ln.split("=", 1)[0].strip() not in updates]
-    out += [f"{k}={v}" for k, v in updates.items()]
+    out += [f"{k}={v}" for k, v in updates.items() if v is not None]
     try:
         cfg.write_text("\n".join(out) + "\n")
     except Exception as e:  # noqa: BLE001
         err(f"[!] Could not update {cfg}: {e}")
+
+
+def _sdk_install(image):
+    """Install an SDK package (e.g. a system image), preferring the new 'android'
+    CLI and falling back to the legacy sdkmanager.
+
+    Command-line tools shipped since 2025 deprecate sdkmanager in favour of a new
+    'android' binary: `sdkmanager --install "system-images;android-35;..."` now
+    only prints 'Package ... not found' and redirects. The new CLI takes
+    slash-separated coordinates instead, e.g.
+    `android sdk install system-images/android-35/google_apis_playstore/x86_64`.
+    Output streams live because the image download is large and slow.
+    """
+    if ANDROID_CLI and ANDROID_CLI.exists():
+        pkg = image.replace(";", "/")
+        log(f"[*] Installing system image via android CLI: {pkg}")
+        # --no-metrics skips the first-run analytics prompt; the piped y's accept
+        # the SDK license on a machine where it hasn't been accepted yet (a no-op
+        # when Android Studio already accepted it).
+        return run([str(ANDROID_CLI), "sdk", "install", pkg, "--no-metrics"],
+                   input_data="y\n" * 20, capture=False)
+    log("[*] Accepting SDK licenses ...")
+    bat(SDKMANAGER, "--licenses", input_data="y\n" * 30)
+    log(f"[*] Installing system image via sdkmanager: {image}")
+    return bat(SDKMANAGER, "--install", image, input_data="y\n" * 10)
+
+
+def _sdk_remove(image):
+    """Remove an SDK package, preferring the new 'android' CLI (slash-separated
+    coordinates) and falling back to legacy sdkmanager --uninstall."""
+    if ANDROID_CLI and ANDROID_CLI.exists():
+        pkg = image.replace(";", "/")
+        return run([str(ANDROID_CLI), "sdk", "remove", pkg, "--no-metrics"],
+                   input_data="y\n" * 5)
+    return bat(SDKMANAGER, "--uninstall", image, input_data="y\n" * 5)
 
 
 def provision_avd():
@@ -920,21 +1000,17 @@ def provision_avd():
     image_dir = _default_system_image_dir()
 
     if image_dir.exists():
-        log(f"[=] System image already installed, skipping sdkmanager: {image}")
+        log(f"[=] System image already installed, skipping install: {image}")
     else:
-        log("[*] Accepting SDK licenses ...")
-        bat(SDKMANAGER, "--licenses", input_data="y\n" * 30)
-        log(f"[*] Installing system image: {image}")
-        r = bat(SDKMANAGER, "--install", image, input_data="y\n" * 10)
-        # sdkmanager on Windows often returns a non-zero exit code even when the
-        # download/install succeeded, so trust whether the image actually landed
-        # rather than the exit code.
+        r = _sdk_install(image)
+        # The installer can exit non-zero on Windows even when the download
+        # succeeded, so trust whether the image actually landed on disk rather
+        # than the exit code. On failure the streamed output above shows why.
         if not image_dir.exists():
-            err(r.stdout)
-            err(r.stderr)
-            raise MissingTool(f"sdkmanager failed to install {image}")
+            raise MissingTool(
+                f"failed to install system image {image} — see output above.")
         if r.returncode != 0:
-            log(f"[!] sdkmanager exit code {r.returncode}, but the image is "
+            log(f"[!] installer exit code {r.returncode}, but the image is "
                 f"present — continuing.")
 
     if _avd_exists(AVD_NAME):
@@ -955,7 +1031,19 @@ def provision_avd():
     # Apply config.ini settings before launch (read at boot). hw.keyboard=yes is
     # always set (avdmanager AVDs default to hw.keyboard=no → host keyboard
     # ignored); RAM / data-partition / sdcard come from avd_config.ini when set.
-    cfg = {"hw.keyboard": "yes"}
+    cfg = {
+        "hw.keyboard": "yes",
+        # Persistence: a stray 'disk.dataPartition.path=<temp>' (which some
+        # avdmanager/emulator combos write) makes /data ephemeral — every power
+        # cycle wipes the Magisk app, its su grants and /data/adb modules, even
+        # though the ramdisk su binary survives on the SDK image. Drop it so the
+        # emulator uses the persistent userdata-qemu.img.
+        "disk.dataPartition.path": None,
+        # Force a COLD boot every launch so the rootAVD-patched ramdisk (Magisk
+        # su) reloads; a fast/quick boot restores a snapshot and would not.
+        "fastboot.forceColdBoot": "yes",
+        "fastboot.forceFastBoot": "no",
+    }
     if RAM_MB:
         cfg["hw.ramSize"] = str(RAM_MB)
     if STORAGE:
@@ -965,7 +1053,8 @@ def provision_avd():
         cfg["sdcard.size"] = _normalize_size(SDCARD)
     _set_avd_config(cfg)
     log("[=] AVD config applied: "
-        + ", ".join(f"{k}={v}" for k, v in cfg.items()))
+        + ", ".join(f"{k}={v}" for k, v in cfg.items() if v is not None)
+        + ", disk.dataPartition.path=removed")
 
     log(f"[*] Launching emulator '{AVD_NAME}' ...")
     EMULATOR_PROC = subprocess.Popen([str(EMULATOR), "-avd", AVD_NAME,
@@ -1006,6 +1095,54 @@ def cold_boot_avd():
               "  (a normal start/reboot will NOT load the patched ramdisk)")
     wait_for_boot()
     log("[+] AVD cold-booted.")
+
+
+def _magisk_app_installed():
+    r = adb("shell", "pm", "list", "packages", "com.topjohnwu.magisk")
+    return "com.topjohnwu.magisk" in (r.stdout or "")
+
+
+def _find_magisk_apk():
+    """Locate the Magisk app APK shipped with rootAVD (Apps/Magisk.apk)."""
+    bases = []
+    if ROOTAVD_BAT:
+        bases.append(Path(ROOTAVD_BAT).parent)
+    bases.append(TOOLING_DIR)
+    for base in bases:
+        cand = base / "Apps" / "Magisk.apk"
+        if cand.exists():
+            return cand
+        hits = list(base.glob("**/Magisk.apk"))
+        if hits:
+            return hits[0]
+    return None
+
+
+def ensure_magisk_app():
+    """Reinstall the Magisk app if it vanished after the FAKEBOOTING cold boot.
+
+    rootAVD uses a *temporary* Magisk app to patch the fake boot image; on the
+    cold boot that temp app removes itself, so com.topjohnwu.magisk is gone even
+    though root works (the su binary in the patched ramdisk is present — `su`
+    returns 'Permission denied', not 'not found'). Reinstall the real app from
+    rootAVD's Apps/Magisk.apk so its one-time 'Additional Setup' can be done.
+    """
+    if _magisk_app_installed():
+        return
+    apk = _find_magisk_apk()
+    if not apk:
+        err("[!] Magisk app is missing and Apps/Magisk.apk was not found; "
+            "install Magisk manually on the AVD to finish setup.")
+        return
+    log(f"[*] Magisk app missing after cold boot; reinstalling {apk.name} ...")
+    r = adb("install", "-r", str(apk))
+    if "Success" in (r.stdout or "") or _magisk_app_installed():
+        log("[+] Magisk app reinstalled.")
+    else:
+        err(r.stdout)
+        err(r.stderr)
+        err(f"[!] Could not reinstall the Magisk app automatically; install "
+            f"{apk} manually on the AVD.")
 
 
 def do_rooting():
@@ -1073,8 +1210,10 @@ def do_rooting():
         # 7) Finalize Magisk. The patched ramdisk loads on cold boot, but Magisk's
         #    su/daemon need a one-time "Additional Setup" that writes its env to
         #    /data/adb/magisk (rootAVD's temporary-Magisk removal wipes it). Until
-        #    that's done + a reboot, `su` returns Permission denied. Bring the app to
-        #    the foreground and walk the user through it.
+        #    that's done + a reboot, `su` returns Permission denied. The temp
+        #    Magisk app is also gone after the cold boot, so reinstall it first,
+        #    then bring it to the foreground and walk the user through setup.
+        ensure_magisk_app()
         try:
             adb("shell", "monkey", "-p", "com.topjohnwu.magisk",
                 "-c", "android.intent.category.LAUNCHER", "1")
