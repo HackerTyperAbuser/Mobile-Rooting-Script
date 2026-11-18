@@ -20,6 +20,7 @@ avdmanager, emulator) and OpenSSL.
 import argparse
 import configparser
 import ctypes 
+import glob
 import os
 import shutil
 import signal
@@ -565,31 +566,108 @@ def resolve_sdk_tooling():
     log(f"[=] AVD home: {avd_home}")
 
 
+def _registry_path_dirs():
+    """Read the CURRENT machine+user PATH straight from the registry.
+
+    winget updates PATH in the registry, but this already-running process (and
+    the shell that launched it) keeps the stale copy it inherited at startup.
+    That is why a freshly winget-installed openssl stays invisible to
+    shutil.which() until a new terminal is opened. Reading the registry lets us
+    find it within the same session.
+    """
+    dirs = []
+    try:
+        import winreg
+    except Exception:  # noqa: BLE001 - not Windows
+        return dirs
+    for hive, sub in (
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+        (winreg.HKEY_CURRENT_USER, "Environment"),
+    ):
+        try:
+            with winreg.OpenKey(hive, sub) as k:
+                val, _ = winreg.QueryValueEx(k, "Path")
+        except OSError:
+            continue
+        for d in str(val).split(os.pathsep):
+            d = os.path.expandvars(d.strip().strip('"'))
+            if d:
+                dirs.append(d)
+    return dirs
+
+
+def _resolve_openssl():
+    """Locate openssl.exe without requiring a shell restart.
+
+    Order: $OPENSSL_EXE override -> this process's PATH -> known install dirs
+    (ShiningLight, Git for Windows, winget shims) -> the registry PATH.
+    """
+    override = os.environ.get("OPENSSL_EXE", "").strip().strip('"')
+    if override and Path(override).is_file():
+        return override
+
+    found = shutil.which("openssl")
+    if found:
+        return found
+
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    local = os.environ.get("LOCALAPPDATA", "")
+    patterns = [
+        pf + r"\OpenSSL-Win64*\bin\openssl.exe",
+        pf + r"\OpenSSL*\bin\openssl.exe",
+        pf86 + r"\OpenSSL-Win32*\bin\openssl.exe",
+        pf86 + r"\OpenSSL*\bin\openssl.exe",
+        r"C:\OpenSSL-Win64*\bin\openssl.exe",
+        r"C:\OpenSSL*\bin\openssl.exe",
+        pf + r"\Git\usr\bin\openssl.exe",
+        pf + r"\Git\mingw64\bin\openssl.exe",
+        pf86 + r"\Git\usr\bin\openssl.exe",
+    ]
+    if local:
+        patterns += [
+            local + r"\Microsoft\WinGet\Links\openssl.exe",
+            local + r"\Microsoft\WinGet\Packages\*OpenSSL*\**\openssl.exe",
+        ]
+    for pat in patterns:
+        for hit in sorted(glob.glob(pat, recursive=True), reverse=True):
+            if Path(hit).is_file():
+                return hit
+
+    reg_dirs = _registry_path_dirs()
+    if reg_dirs:
+        found = shutil.which("openssl", path=os.pathsep.join(reg_dirs))
+        if found:
+            return found
+    return None
+
+
 def ensure_tooling():
     global OPENSSL
     progress.start(1, "tooling")
     resolve_sdk_tooling()
 
     # --- OpenSSL (auto-install in autonomous mode, gated in --manual) ---
-    openssl_path = shutil.which("openssl")
-    if not openssl_path:
-        git_ssl = Path(r"C:\Program Files\Git\usr\bin\openssl.exe")
-        if git_ssl.exists():
-            openssl_path = str(git_ssl)
+    openssl_path = _resolve_openssl()
     if not openssl_path:
         if MANUAL and not ask_yes_no("Install OpenSSL? (y/n)"):
             abort()
         winget_install(OPENSSL_WINGET_ID)
-        openssl_path = shutil.which("openssl")
-        if not openssl_path:
-            # ShiningLight installs under Program Files; probe common locations.
-            for base in (r"C:\Program Files\OpenSSL-Win64\bin\openssl.exe",
-                         r"C:\Program Files\OpenSSL\bin\openssl.exe"):
-                if Path(base).exists():
-                    openssl_path = base
-                    break
+        # winget writes the new PATH to the registry, not into this running
+        # process, so re-resolve the full way (registry PATH included) rather
+        # than just re-checking shutil.which() — that is what used to force a
+        # shell restart after an otherwise successful install.
+        openssl_path = _resolve_openssl()
     if not openssl_path:
-        raise MissingTool("openssl (installed but not found on PATH; reopen shell)")
+        err("[x] openssl.exe not found, even after installation.")
+        err("    Looked on PATH, in the registry PATH, and under:")
+        err(r"      <ProgramFiles>\OpenSSL-Win64*\bin, <ProgramFiles>\Git\usr\bin,")
+        err(r"      <ProgramFiles(x86)>\OpenSSL-Win32*\bin, C:\OpenSSL*\bin,")
+        err(r"      <LocalAppData>\Microsoft\WinGet\{Links,Packages}")
+        err("    Fix: point OPENSSL_EXE at the full path to openssl.exe, e.g.")
+        err(r'      set OPENSSL_EXE=C:\Program Files\OpenSSL-Win64\bin\openssl.exe')
+        raise MissingTool("openssl not found")
     OPENSSL = openssl_path
     log(f"[=] openssl: {OPENSSL}")
 
