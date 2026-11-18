@@ -61,8 +61,8 @@ TOOLING_URLS = {
         "https://github.com/MhmRdd/NoHello/releases/download/0.0.7/"
         "Nohello-v0.0.7-53-4d53ecf-release.zip",
     "ZygiskNext.zip":
-        "https://github.com/LSPosed/ZygiskNext/releases/download/1.5.0/"
-        "Zygisk-Next-1.5.0-843-5217106-release.zip",
+        "https://github.com/LSPosed/ZygiskNext/releases/download/v1.5.3/"
+        "Zygisk-Next-1.5.3-880-22a1bf5-release.zip",
     "adguardcert.zip":
         "https://github.com/trongngk/tmp/releases/download/checklist/"
         "adguardcert-v2.1_2.zip",
